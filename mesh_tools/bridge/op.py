@@ -101,6 +101,9 @@ class MESH_OT_bridge_plus(bpy.types.Operator):
             
             if new_verts:
                 self.project_verts(context, list(new_verts), obj)
+        
+        # Recalculate normals to ensure consistency
+        bmesh.ops.recalc_face_normals(bm, faces=new_faces)
 
         bmesh.update_edit_mesh(me)
         return {'FINISHED'}
