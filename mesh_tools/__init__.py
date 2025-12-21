@@ -1,7 +1,7 @@
 import bpy
 
 from .drag_face import register as register_drag_face, unregister as unregister_drag_face
-
+from .bridge import register as register_bridge, unregister as unregister_bridge
 
 bl_info = {
     "name": "Mesh Tools",
@@ -15,8 +15,10 @@ bl_info = {
 
 def register():
     register_drag_face()
+    register_bridge()
 
 def unregister():
+    unregister_bridge()
     unregister_drag_face()
 
 if __name__ == "__main__":
