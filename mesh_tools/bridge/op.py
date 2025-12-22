@@ -446,7 +446,8 @@ class MESH_OT_bridge_plus(bpy.types.Operator):
         last_layer = vertex_grid[-1]
         tot_verts = max(last_layer) + 1
         last_layer_index = len(vertex_grid) - 1
-        cuts = len(vertex_grid)
+        cuts = max(last_layer_index, cuts) # len(vertex_grid)
+        extra_cuts = cuts - last_layer_index + 1
 
         # Get vertices for first and last layers, in order.
         first_layer_vertices = self.walk_vertices_along_edges(edges_small)
@@ -484,45 +485,61 @@ class MESH_OT_bridge_plus(bpy.types.Operator):
         debug_main_lines = (line0, line1)
         debug_crossed_lines = slice_lines
 
-        print("last_layer_index", last_layer_index)
-        print("first_layer", first_layer)
-        print("last_layer", last_layer)
-        print("line0", line0)
-        print("line1", line1)
-        print("slice_lines", slice_lines)
+        ## print("last_layer_index", last_layer_index)
+        ## print("first_layer", first_layer)
+        ## print("last_layer", last_layer)
+        ## print("line0", line0)
+        ## print("line1", line1)
+        ## print("slice_lines", slice_lines)
 
         # Add verts.
         new_verts = first_layer_vertices
         for layer_index, vert_indices in enumerate(vertex_grid):
-            if layer_index == last_layer_index or layer_index == 0:
+            if (layer_index == last_layer_index and extra_cuts == 0) or layer_index == 0:
                 continue
             layer_slice_count = len(vert_indices) - 1
             slice_line = slice_lines[layer_index-1]
 
             if self.inverted:
                 vert_indices = reversed(vert_indices)
-            print("layer_index", layer_index-1)
-            print("\t- vert_indices", vert_indices)
-            print("\t- layer_slice_count", layer_slice_count)
-            print("\t- slice_line", slice_line)
+            ## print("layer_index", layer_index-1)
+            ## print("\t- vert_indices", vert_indices)
+            ## print("\t- layer_slice_count", layer_slice_count)
+            ## print("\t- slice_line", slice_line)
             
             for slice_position, v in enumerate(vert_indices):
                 if v < 0: continue
                 slice_t = slice_position / layer_slice_count
                 point = self.sample_point_in_line(*slice_line, slice_t)
-                print("\t- slice_position", slice_position)
-                print("\t- slice_t", slice_t)
-                print("\t- point", point)
-                
+                ## print("\t- slice_position", slice_position)
+                ## print("\t- slice_t", slice_t)
+                ## print("\t- point", point)
                 new_verts.append(bm.verts.new(point))
 
-        new_verts.extend(last_layer_vertices)
+        if extra_cuts > 0:
+            pass
+        else:
+            new_verts.extend(last_layer_vertices)
 
         # Create faces.
         for face_index in face_indices:
             new_faces.append(bm.faces.new([
                 new_verts[i] for i in face_index
             ]))
+
+        if extra_cuts > 0:
+            last_cut_verts = new_verts[-len(last_layer_vertices):]
+            last_cut_edges = []
+            for v in last_cut_verts:
+                for e in v.link_edges:
+                    if e not in last_cut_edges and len(e.link_faces) == 1 and e.verts[0] in last_cut_verts and e.verts[1] in last_cut_verts:
+                        last_cut_edges.append(e)
+
+            ret = self.custom_bridge(bm, edges_small=last_cut_edges, edges_large=edges_large, cuts=extra_cuts, smoothness=smoothness)
+            if ret and 'faces' in ret:
+                new_faces.extend(ret['faces'])
+            else:
+                print("Error bridging extra cuts")
 
         return {'faces': new_faces}
 
