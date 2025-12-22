@@ -1,6 +1,111 @@
+from bmesh.types import BMEdge, BMFace, BMVert
 import bpy
 import bmesh
-import mathutils
+from mathutils import Vector
+
+import gpu
+from gpu_extras.batch import batch_for_shader
+from gpu import state as gpu_state
+
+from .config import TRANSITION_PATTERNS
+
+from typing import List, Set, Tuple
+from dataclasses import dataclass
+from collections import defaultdict
+
+
+
+
+
+@dataclass
+class IEdgePattern:
+    from_edge_index: int
+    to_edge_index: int
+
+@dataclass
+class LayerPattern:
+    edge_pattern: list[IEdgePattern]
+    
+    @property
+    def edge_count(self):
+        return len(self.edge_pattern)
+
+@dataclass
+class TransitionPattern:
+    layers: list[LayerPattern]
+    
+    @property
+    def layer_count(self):
+        return len(self.layers)
+
+
+_TRANSITIONS = {
+    '''
+    1 -> 2
+        |     A1     |  # start - small edge loop with 1 edge
+   A1v0 |____________| A1v1
+        |   F1   /F2 |  # first intermediate layer
+        |_______     |
+        |   F3 |  F2 |  # second intermediate layer
+   B1v0 |____________| B1v1
+        | B1   | B2  |  # end - large edge loop with 2 edges
+    '''
+    '1_to_2': TransitionPattern([
+        LayerPattern([IEdgePattern(0, 0), IEdgePattern(1, 1), IEdgePattern(1, 2)]),
+        LayerPattern([IEdgePattern(0, 0), IEdgePattern(1, 1), IEdgePattern(1, 2)]),
+        LayerPattern([IEdgePattern(0, 0), IEdgePattern(1, 1), IEdgePattern(1, 2)]),
+    ]),
+}
+
+
+debug_main_lines = []
+debug_crossed_lines = []
+
+
+
+class MESH_OT_bridge_plus_debug(bpy.types.Operator):
+    """Bridge two edge selections with support for unequal counts and projection"""
+    bl_idname = "mesh.bridge_plus_debug"
+    bl_label = "Bridge Plus Debug"
+
+    _debug_instance = None
+
+    def invoke(self, context: bpy.types.Context, event: bpy.types.Event):
+        if self.__class__._debug_instance:
+            self.stop_debug(context)
+            self.__class__._debug_instance = None
+        else:
+            self.__class__._debug_instance = self.start_debug(context)
+        return {'FINISHED'}
+
+    def start_debug(self, context: bpy.types.Context):
+        context.area.tag_redraw()
+        return context.space_data.draw_handler_add(self.__class__.draw_debug, (), 'WINDOW', 'POST_VIEW')
+
+    def stop_debug(self, context: bpy.types.Context):
+        context.space_data.draw_handler_remove(self.__class__._debug_instance, 'WINDOW')
+        context.area.tag_redraw()
+
+    @staticmethod
+    def draw_debug():
+        shader = gpu.shader.from_builtin('POLYLINE_UNIFORM_COLOR')
+
+        def _draw_line(coords: Tuple[Vector, Vector], color: Tuple[float, float, float, float]):
+            batch = batch_for_shader(shader, 'LINES', {"pos": coords})
+            shader.uniform_float("viewportSize", gpu.state.viewport_get()[2:])
+            shader.uniform_float("lineWidth", 4.5)
+            shader.uniform_float("color", color)
+            batch.draw(shader)
+
+        if debug_main_lines:
+            for line in debug_main_lines:
+                _draw_line(line, color=(1, 1, 0, 1))
+        if debug_crossed_lines:
+            for line in debug_crossed_lines:
+                _draw_line(line, color=(1, 0, 0, 1))
+
+    
+
 
 class MESH_OT_bridge_plus(bpy.types.Operator):
     """Bridge two edge selections with support for unequal counts and projection"""
@@ -45,6 +150,18 @@ class MESH_OT_bridge_plus(bpy.types.Operator):
         default=0.01
     )
 
+    only_quads: bpy.props.BoolProperty(
+        name="Only Quads",
+        description="Use only quads for bridging (uses poles for transitions between different edge counts)",
+        default=True
+    )
+    
+    inverted: bpy.props.BoolProperty(
+        name="Inverted",
+        description="Mirror the bridge geometry",
+        default=False
+    )
+
     def execute(self, context):
         obj = context.edit_object
         if not obj or obj.type != 'MESH':
@@ -79,8 +196,16 @@ class MESH_OT_bridge_plus(bpy.types.Operator):
                 l1_edges, l2_edges = islands[1], islands[0]
             else:
                 l1_edges, l2_edges = islands[0], islands[1]
-                
-            ret = self.custom_bridge(bm, l1_edges, l2_edges, self.cuts, self.smoothness)
+
+            # Determine which bridge method to use
+            count_small = len(l1_edges)
+            count_large = len(l2_edges)
+            use_quads_only = self.only_quads and (count_small != count_large)
+
+            if use_quads_only:
+                ret = self.custom_bridge_quads_e5_e3(bm, l1_edges, l2_edges, self.cuts, self.smoothness)
+            else:
+                ret = self.custom_bridge(bm, l1_edges, l2_edges, self.cuts, self.smoothness)
 
         except Exception as e:
             self.report({'ERROR'}, f"Bridge failed: {str(e)}")
@@ -297,6 +422,150 @@ class MESH_OT_bridge_plus(bpy.types.Operator):
                 except ValueError: pass
 
         return {'faces': new_faces}
+
+    def custom_bridge_quads_e5_e3(self, bm, edges_small, edges_large, cuts, smoothness):
+        """
+        Bridge with only quads using poles (E5/E3) for smooth transitions.
+        E5 poles (valence 5) increase edge count by +1
+        E3 poles (valence 3) decrease edge count by -1
+        """
+        # Find the ideal the pattern of the edge count for both ends.
+        small_count = len(edges_small)
+        large_count = len(edges_large)
+
+        transition_pattern = TRANSITION_PATTERNS.get(f'{small_count}_to_{large_count}')
+        if not transition_pattern:
+            raise Exception(f"No transition pattern found for {small_count} to {large_count}")
+
+        # Create the geometry.
+        new_faces: List[BMFace] = []
+        vertex_grid: List[List[int | None]] = transition_pattern['vertex_grid']
+        face_indices: List[List[int]] = transition_pattern['face_indices']
+
+        first_layer = vertex_grid[0]
+        last_layer = vertex_grid[-1]
+        tot_verts = max(last_layer) + 1
+        last_layer_index = len(vertex_grid) - 1
+        cuts = len(vertex_grid)
+
+        # Get vertices for first and last layers, in order.
+        first_layer_vertices = self.walk_vertices_along_edges(edges_small)
+        last_layer_vertices = self.walk_vertices_along_edges(edges_large)
+
+        # Get the ends of both edge loops.
+        v0_small = first_layer_vertices[0]
+        v0_large = last_layer_vertices[0]
+        v1_small = first_layer_vertices[-1]
+        v1_large = last_layer_vertices[-1]
+
+        # See if v0_small is better aligned with v0_large or v1_large.
+        # Closer to the same end (by index) or the other one?
+        # If to the opposite, then we need to reverse one of the lists.
+        d0 = (v0_small.co - v0_large.co).length
+        d1 = (v1_small.co - v0_large.co).length
+        if d0 > d1:
+            v0_large, v1_large = v1_large, v0_large
+            last_layer_vertices = last_layer_vertices[::-1]
+
+        # Virtual lines between v0_small and v0_large, and v0_small and v1_large.
+        line0 = (v0_small.co, v0_large.co)
+        line1 = (v1_small.co, v1_large.co)
+
+        # Create virtual lines along both lines, this lines should cut the line0 and line1 at the same t value.
+        slice_lines = []
+        for i in range(cuts):
+            t = (i + 1) / (cuts + 1)
+            slice_lines.append((
+                self.sample_point_in_line(*line0, t),
+                self.sample_point_in_line(*line1, t)
+            ))
+
+        global debug_main_lines, debug_crossed_lines
+        debug_main_lines = (line0, line1)
+        debug_crossed_lines = slice_lines
+
+        print("last_layer_index", last_layer_index)
+        print("first_layer", first_layer)
+        print("last_layer", last_layer)
+        print("line0", line0)
+        print("line1", line1)
+        print("slice_lines", slice_lines)
+
+        # Add verts.
+        new_verts = first_layer_vertices
+        for layer_index, vert_indices in enumerate(vertex_grid):
+            if layer_index == last_layer_index or layer_index == 0:
+                continue
+            layer_slice_count = len(vert_indices) - 1
+            slice_line = slice_lines[layer_index-1]
+
+            if self.inverted:
+                vert_indices = reversed(vert_indices)
+            print("layer_index", layer_index-1)
+            print("\t- vert_indices", vert_indices)
+            print("\t- layer_slice_count", layer_slice_count)
+            print("\t- slice_line", slice_line)
+            
+            for slice_position, v in enumerate(vert_indices):
+                if v < 0: continue
+                slice_t = slice_position / layer_slice_count
+                point = self.sample_point_in_line(*slice_line, slice_t)
+                print("\t- slice_position", slice_position)
+                print("\t- slice_t", slice_t)
+                print("\t- point", point)
+                
+                new_verts.append(bm.verts.new(point))
+
+        new_verts.extend(last_layer_vertices)
+
+        # Create faces.
+        for face_index in face_indices:
+            new_faces.append(bm.faces.new([
+                new_verts[i] for i in face_index
+            ]))
+
+        return {'faces': new_faces}
+
+    def walk_vertices_along_edges(self, edges):
+        vertices = defaultdict(list)
+        for e in edges:
+            v1, v2 = e.verts
+            vertices[v1].append(e)
+            vertices[v2].append(e)
+
+        # Find first vert to walk.
+        first_vert = None
+        for v, edges in vertices.items():
+            if len(edges) == 1:
+                first_vert = v
+                break
+
+        def _walk_vert_over_edges(v: BMVert, _edges: Set[BMEdge], visited: Set[BMVert], vertices_walk: List[BMVert]):
+            if v in visited: return vertices_walk
+            visited.add(v)
+            vertices_walk.append(v)
+            for e in v.link_edges:
+                if e not in _edges: continue
+                v1, v2 = e.verts
+                if v1 != v:
+                    _walk_vert_over_edges(v1, vertices[v1], visited, vertices_walk)
+                if v2 != v:
+                    _walk_vert_over_edges(v2, vertices[v2], visited, vertices_walk)
+            return vertices_walk
+
+        return _walk_vert_over_edges(first_vert, set(edges), set(), [])
+
+    def sample_n_points_along_line(self, a, b, count):
+        # Sample 'count' 3d points along the line_a and line_b.
+        points = []
+        for i in range(count):
+            t = (i + 1) / count
+            points.append(a.lerp(b, t))
+        return points
+    
+    def sample_point_in_line(self, a, b, t):
+        # Sample a point in the line from a to b at t.
+        return a.lerp(b, t)
 
     def get_ordered_verts(self, edges):
         # Convert edge soup to ordered verts

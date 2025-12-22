@@ -12,3 +12,4 @@ class MESH_PT_mesh_tools_bridge(bpy.types.Panel):
         layout = self.layout
         col = layout.column(align=True)
         col.operator("mesh.bridge_plus", text="Bridge Plus")
+        col.operator("mesh.bridge_plus_debug", text="Start/Stop Debug")
