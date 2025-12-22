@@ -14,7 +14,7 @@ class MESH_OT_bridge_plus(bpy.types.Operator):
         default=5,
         min=0
     )
-    
+
     smoothness: bpy.props.FloatProperty(
         name="Smoothness",
         description="Smoothness factor for the bridge",
@@ -22,16 +22,26 @@ class MESH_OT_bridge_plus(bpy.types.Operator):
         min=0.0,
         max=100.0
     )
-    
+
     use_projection: bpy.props.BoolProperty(
         name="Project Over Meshes",
         description="Project the bridge geometry onto other visible meshes",
         default=True
     )
+
+    projection_mode: bpy.props.EnumProperty(
+        name="Projection Mode",
+        description="Mode of projection to apply",
+        items=[
+            ('FACE_PROJECT', "Face Project", "Project onto faces from view"),
+            ('CLOSEST_POINT', "Closest Point", "Project onto closest points in mesh"),
+        ],
+        default='CLOSEST_POINT'
+    )
     
     offset: bpy.props.FloatProperty(
         name="Projection Offset",
-        description="Offset from the surface",
+        description="Offset from the surface (only for Closest-Point projection)",
         default=0.01
     )
 
@@ -78,10 +88,10 @@ class MESH_OT_bridge_plus(bpy.types.Operator):
             traceback.print_exc()
             return {'CANCELLED'}
         
+        new_faces = ret['faces']
+
         # 3. Project
-        if self.use_projection:
-            new_faces = ret['faces']
-            
+        if self.use_projection and self.projection_mode == 'CLOSEST_POINT':
             # Identify new vertices (inner vertices of the bridge)
             # We want to project the vertices that were created by the bridge, 
             # especially the intermediate ones (from cuts).
@@ -105,7 +115,36 @@ class MESH_OT_bridge_plus(bpy.types.Operator):
         # Recalculate normals to ensure consistency
         bmesh.ops.recalc_face_normals(bm, faces=new_faces)
 
+        # Ensure new faces are selected
+        for e in selected_edges:
+            e.select = False
+        for f in bm.faces:
+            f.select = False
+        for f in new_faces:
+            f.select = True
+
         bmesh.update_edit_mesh(me)
+
+        # Switch to Face Mode and perform Translate with Face Project Snap
+        bpy.ops.mesh.select_mode(type='FACE')
+        
+        if self.projection_mode == 'FACE_PROJECT':
+            bpy.ops.transform.translate(
+                value=(0, 0, 0), 
+                orient_type='GLOBAL', 
+                orient_matrix=((1, 0, 0), (0, 1, 0), (0, 0, 1)), 
+                orient_matrix_type='GLOBAL', 
+                mirror=True, 
+                snap=True, 
+                snap_elements={'FACE_PROJECT'}, 
+                use_snap_project=True, 
+                snap_target='CLOSEST', 
+                use_snap_self=True, 
+                use_snap_edit=True, 
+                use_snap_nonedit=True, 
+                use_snap_selectable=False
+            )
+
         return {'FINISHED'}
 
     def custom_bridge(self, bm, edges_small, edges_large, cuts, smoothness):
