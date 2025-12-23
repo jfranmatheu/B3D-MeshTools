@@ -5,62 +5,15 @@ from mathutils import Vector
 
 import gpu
 from gpu_extras.batch import batch_for_shader
-from gpu import state as gpu_state
 
 from .config import TRANSITION_PATTERNS
 
 from typing import List, Set, Tuple
-from dataclasses import dataclass
 from collections import defaultdict
-
-
-
-
-
-@dataclass
-class IEdgePattern:
-    from_edge_index: int
-    to_edge_index: int
-
-@dataclass
-class LayerPattern:
-    edge_pattern: list[IEdgePattern]
-    
-    @property
-    def edge_count(self):
-        return len(self.edge_pattern)
-
-@dataclass
-class TransitionPattern:
-    layers: list[LayerPattern]
-    
-    @property
-    def layer_count(self):
-        return len(self.layers)
-
-
-_TRANSITIONS = {
-    '''
-    1 -> 2
-        |     A1     |  # start - small edge loop with 1 edge
-   A1v0 |____________| A1v1
-        |   F1   /F2 |  # first intermediate layer
-        |_______     |
-        |   F3 |  F2 |  # second intermediate layer
-   B1v0 |____________| B1v1
-        | B1   | B2  |  # end - large edge loop with 2 edges
-    '''
-    '1_to_2': TransitionPattern([
-        LayerPattern([IEdgePattern(0, 0), IEdgePattern(1, 1), IEdgePattern(1, 2)]),
-        LayerPattern([IEdgePattern(0, 0), IEdgePattern(1, 1), IEdgePattern(1, 2)]),
-        LayerPattern([IEdgePattern(0, 0), IEdgePattern(1, 1), IEdgePattern(1, 2)]),
-    ]),
-}
 
 
 debug_main_lines = []
 debug_crossed_lines = []
-
 
 
 class MESH_OT_bridge_plus_debug(bpy.types.Operator):
@@ -89,6 +42,7 @@ class MESH_OT_bridge_plus_debug(bpy.types.Operator):
     @staticmethod
     def draw_debug():
         shader = gpu.shader.from_builtin('POLYLINE_UNIFORM_COLOR')
+        global debug_main_lines, debug_crossed_lines
 
         def _draw_line(coords: Tuple[Vector, Vector], color: Tuple[float, float, float, float]):
             batch = batch_for_shader(shader, 'LINES', {"pos": coords})
@@ -224,19 +178,19 @@ class MESH_OT_bridge_plus(bpy.types.Operator):
             # Usually yes, unless we want to move the whole strip. 
             # Let's assume we only move the NEW vertices.
             
-            original_verts = set()
+            original_verts: Set[BMVert] = set()
             for e in selected_edges:
                 original_verts.update(e.verts)
-                
-            new_verts = set()
+
+            new_verts: Set[BMVert] = set()
             for f in new_faces:
                 for v in f.verts:
                     if v not in original_verts:
                         new_verts.add(v)
-            
+
             if new_verts:
                 self.project_verts(context, list(new_verts), obj)
-        
+
         # Recalculate normals to ensure consistency
         bmesh.ops.recalc_face_normals(bm, faces=new_faces)
 
