@@ -10,6 +10,8 @@ from .config import TRANSITION_PATTERNS
 
 from typing import List, Set, Tuple
 from collections import defaultdict
+from itertools import chain
+from math import degrees, sin
 
 
 debug_main_lines = []
@@ -66,6 +68,12 @@ class MESH_OT_bridge_plus(bpy.types.Operator):
     bl_idname = "mesh.bridge_plus"
     bl_label = "Bridge Plus"
     bl_options = {'REGISTER', 'UNDO'}
+
+    use_auto_cuts: bpy.props.BoolProperty(
+        name="Auto Cuts",
+        description="Automatically determine the number of cuts based on the edge counts",
+        default=False
+    )
 
     cuts: bpy.props.IntProperty(
         name="Cuts",
@@ -371,7 +379,7 @@ class MESH_OT_bridge_plus(bpy.types.Operator):
 
         return {'faces': new_faces}
 
-    def custom_bridge_quads_e5_e3(self, bm, edges_small, edges_large, cuts, smoothness):
+    def custom_bridge_quads_e5_e3(self, bm: bmesh.types.BMesh, edges_small: List[BMEdge], edges_large: List[BMEdge], cuts: int, smoothness: float):
         """
         Bridge with only quads using poles (E5/E3) for smooth transitions.
         E5 poles (valence 5) increase edge count by +1
@@ -389,13 +397,6 @@ class MESH_OT_bridge_plus(bpy.types.Operator):
         new_faces: List[BMFace] = []
         vertex_grid: List[List[int | None]] = transition_pattern['vertex_grid']
         face_indices: List[List[int]] = transition_pattern['face_indices']
-
-        first_layer = vertex_grid[0]
-        last_layer = vertex_grid[-1]
-        tot_verts = max(last_layer) + 1
-        last_layer_index = len(vertex_grid) - 1
-        cuts = max(last_layer_index, cuts) # len(vertex_grid)
-        extra_cuts = cuts - last_layer_index + 1
 
         # Get vertices for first and last layers, in order.
         first_layer_vertices = self.walk_vertices_along_edges(edges_small)
@@ -419,6 +420,73 @@ class MESH_OT_bridge_plus(bpy.types.Operator):
         # Virtual lines between v0_small and v0_large, and v0_small and v1_large.
         line0 = (v0_small.co, v0_large.co)
         line1 = (v1_small.co, v1_large.co)
+        
+        # Calculate the number of cuts needed.
+        first_layer = vertex_grid[0]
+        last_layer = vertex_grid[-1]
+        tot_verts = max(last_layer) + 1
+        last_layer_index = len(vertex_grid) - 1
+
+        if self.use_auto_cuts:
+            """
+            Calculate the number of cuts needed to bridge the first and last layer based on quad size of both ends.
+            """
+            end_faces: Set[BMFace] = {f for e in chain(edges_small, edges_large) for f in e.link_faces}
+            median_quad_area: float = sum([f.calc_area() for f in end_faces]) / len(end_faces)
+            target_quad_side: float = median_quad_area ** 0.5
+            # Line from the middle of first layer to the middle of last_layer.
+            mid_first = v0_small.co.lerp(v1_small.co, 0.5)
+            mid_last = v0_large.co.lerp(v1_large.co, 0.5)
+
+            # Straight-line distance between the midpoints of the two edge loops
+            mid_line_length = (mid_last - mid_first).length
+
+            # Direction vectors of the two edge loops (using face normals as reference)
+            median_f_normal_small: Vector = sum([f.normal for e in edges_small for f in e.link_faces], Vector((0.0, 0.0, 0.0))) / len(edges_small)
+            median_f_normal_large: Vector = sum([f.normal for e in edges_large for f in e.link_faces], Vector((0.0, 0.0, 0.0))) / len(edges_large)
+
+            dir_small = median_f_normal_small.normalized()
+            dir_large = median_f_normal_large.normalized()
+
+            # Angle between the two loop directions (always 0 to 180 degrees)
+            angle_radians = dir_small.angle(dir_large)
+            angle_degrees = degrees(angle_radians)
+
+            # Base number of cuts assuming straight bridge (flat)
+            flat_segments = mid_line_length // target_quad_side
+            flat_cuts = int(flat_segments) # + 1  # +1 to include the ending layer
+
+            # Check if all end_faces are coplanar (axis-aligned)
+            end_verts_coords: List[Vector] = [v.co for f in end_faces for v in f.verts]
+            # Check for constant X, Y, or Z
+            eps = 0.0001
+            one_plane: bool = any([
+                (max(co.x for co in end_verts_coords) - min(co.x for co in end_verts_coords)) < eps,
+                (max(co.y for co in end_verts_coords) - min(co.y for co in end_verts_coords)) < eps,
+                (max(co.z for co in end_verts_coords) - min(co.z for co in end_verts_coords)) < eps,
+            ])
+
+            if one_plane or angle_degrees < 1.0:  # Treat nearly parallel as flat
+                cuts = flat_cuts
+            else:
+                # Adjust for curvature/bend using chord length approximation
+                # This models the bridge as two straight halves meeting at the bend angle
+                # Effective path length ≈ 2 * distance * sin(θ/2)
+                # This gives more segments when bent (good for sharp angles), fewer when almost flat
+                chord_length = 2.0 * mid_line_length * sin(angle_radians / 2.0)
+                curved_segments = chord_length // target_quad_side
+                cuts = int(curved_segments)  # max(flat_cuts, int(curved_segments) + 1)  # At least the flat amount
+
+                # Optional: add a small safety buffer for very sharp bends
+                # if angle_degrees > 90:
+                #     cuts += 1
+
+            # Final cuts value (number of intermediate layers + 1 for the end)
+            # cuts = cuts + 1
+
+        # Clamp the number of cuts to the number of vertices in the last layer.
+        cuts = max(last_layer_index, cuts) # len(vertex_grid)
+        extra_cuts = cuts - last_layer_index + 1
 
         # Create virtual lines along both lines, this lines should cut the line0 and line1 at the same t value.
         slice_lines = []
