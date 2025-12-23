@@ -109,12 +109,6 @@ class MESH_OT_bridge_plus(bpy.types.Operator):
         description="Use only quads for bridging (uses poles for transitions between different edge counts)",
         default=True
     )
-    
-    inverted: bpy.props.BoolProperty(
-        name="Inverted",
-        description="Mirror the bridge geometry",
-        default=False
-    )
 
     def execute(self, context):
         obj = context.edit_object
@@ -454,8 +448,6 @@ class MESH_OT_bridge_plus(bpy.types.Operator):
             layer_slice_count = len(vert_indices) - 1
             slice_line = slice_lines[layer_index-1]
 
-            if self.inverted:
-                vert_indices = reversed(vert_indices)
             ## print("layer_index", layer_index-1)
             ## print("\t- vert_indices", vert_indices)
             ## print("\t- layer_slice_count", layer_slice_count)
