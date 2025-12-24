@@ -2,6 +2,7 @@ import bpy
 
 from .drag_face import register as register_drag_face, unregister as unregister_drag_face
 from .bridge import register as register_bridge, unregister as unregister_bridge
+from .utils.override_helpers import unregister as unregister_overrides
 
 bl_info = {
     "name": "Mesh Tools",
@@ -20,6 +21,7 @@ def register():
 def unregister():
     unregister_bridge()
     unregister_drag_face()
+    unregister_overrides()
 
 if __name__ == "__main__":
     register()
