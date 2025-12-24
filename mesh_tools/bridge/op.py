@@ -74,7 +74,7 @@ class MESH_OT_bridge_plus(bpy.types.Operator):
     use_auto_cuts: bpy.props.BoolProperty(
         name="Auto Cuts",
         description="Automatically determine the number of cuts based on the edge counts",
-        default=False
+        default=True
     )
 
     cuts: bpy.props.IntProperty(
@@ -364,11 +364,15 @@ class MESH_OT_bridge_plus(bpy.types.Operator):
 
         return {'FINISHED'}
 
-    def custom_bridge(self, bm, edges_small, edges_large, cuts, smoothness):
+    def custom_bridge(self, bm, edges_small, edges_large, cuts, smoothness, path_start_t=0.0):
         """
         Custom bridging for unequal edge counts.
         Creates a transition where the smaller loop connects to a grid 
         that matches the larger loop's count, ensuring mostly quads.
+        
+        Args:
+            path_start_t: Starting parameter (0-1) for path guide when called recursively.
+                         0.0 means start from beginning, >0 means we're continuing from a previous bridge.
         """
         # 1. Order vertices for both loops
         verts_small, closed_small = self.get_ordered_verts(edges_small)
@@ -379,6 +383,68 @@ class MESH_OT_bridge_plus(bpy.types.Operator):
         
         # Assume both have same closed state for now
         is_closed = closed_small and closed_large
+        
+        # Check if we have a draw_path to use as a guide curve
+        use_path_guide = hasattr(self, 'draw_path') and self.draw_path and len(self.draw_path) >= 2
+        
+        # Prepare path guide if available
+        path_sample_func = None
+        if use_path_guide:
+            path_points = self.draw_path
+            path_cumulative_lengths = [0.0]
+            total_path_length = 0.0
+            for i in range(1, len(path_points)):
+                segment_length = (path_points[i] - path_points[i-1]).length
+                total_path_length += segment_length
+                path_cumulative_lengths.append(total_path_length)
+            
+            if total_path_length > 0:
+                # Remap path_start_t to account for recursive calls
+                # path_start_t indicates where we are in the original path (0-1)
+                # We need to remap the local t parameter to the global path parameter
+                path_t_range = 1.0 - path_start_t  # Remaining portion of path to use
+                
+                # Helper function to sample a point along the path at parameter t (0 to 1, local to this bridge)
+                def sample_path_point(t_param_local):
+                    # Remap local t (0-1 for this bridge) to global t (0-1 for entire path)
+                    t_param_global = path_start_t + (t_param_local * path_t_range)
+                    t_param_global = max(0.0, min(1.0, t_param_global))  # Clamp to [0, 1]
+                    
+                    target_distance = t_param_global * total_path_length
+                    # Find which segment contains this distance
+                    segment_idx = 0
+                    for j in range(1, len(path_cumulative_lengths)):
+                        if path_cumulative_lengths[j] >= target_distance:
+                            segment_idx = j - 1
+                            break
+                    # Interpolate within the segment
+                    seg_start_dist = path_cumulative_lengths[segment_idx]
+                    seg_end_dist = path_cumulative_lengths[segment_idx + 1]
+                    seg_length = seg_end_dist - seg_start_dist
+                    if seg_length > 0:
+                        seg_t = (target_distance - seg_start_dist) / seg_length
+                        seg_t = max(0.0, min(1.0, seg_t))
+                        return path_points[segment_idx].lerp(path_points[segment_idx + 1], seg_t)
+                    else:
+                        return path_points[segment_idx]
+                
+                path_sample_func = sample_path_point
+                
+                # Calculate the center points of the start and end edge loops
+                center_start = sum((v.co for v in verts_small), Vector((0, 0, 0))) / len(verts_small)
+                center_end = sum((v.co for v in verts_large), Vector((0, 0, 0))) / len(verts_large)
+                
+                # Calculate the path's start and end points for this bridge segment
+                # Remap the straight line endpoints based on path_start_t
+                path_start_point = sample_path_point(0.0) if path_start_t > 0 else path_points[0]
+                path_end_point = sample_path_point(1.0) if path_start_t < 1.0 else path_points[-1]
+                
+                # Calculate the translation from straight line to path
+                # For recursive calls, we need to adjust the straight line reference
+                straight_start = center_start
+                straight_end = center_end
+            else:
+                use_path_guide = False
              
         # 2. Align loops (find best start index for large loop)
         verts_large = self.align_loops(verts_small, verts_large, is_closed)
@@ -430,6 +496,20 @@ class MESH_OT_bridge_plus(bpy.types.Operator):
                 
                 # Interpolate between small loop and large loop
                 final_co = co_small.lerp(co_large, t) # Linear for now, can use smoothness
+                
+                # Apply path guide if available
+                if use_path_guide and path_sample_func:
+                    # Sample point along the path
+                    path_center = path_sample_func(t)
+                    
+                    # Calculate where we would be on the straight line
+                    straight_center = straight_start.lerp(straight_end, t)
+                    
+                    # Calculate the offset from straight line to path
+                    path_offset = path_center - straight_center
+                    
+                    # Apply the path offset to follow the curve
+                    final_co = final_co + path_offset
                 
                 # Create vertex
                 new_v = bm.verts.new(final_co)
@@ -557,6 +637,9 @@ class MESH_OT_bridge_plus(bpy.types.Operator):
         line0 = (v0_small.co, v0_large.co)
         line1 = (v1_small.co, v1_large.co)
         
+        # Check if we have a draw_path to use as a guide curve
+        use_path_guide = hasattr(self, 'draw_path') and self.draw_path and len(self.draw_path) >= 2
+        
         # Calculate the number of cuts needed.
         first_layer = vertex_grid[0]
         last_layer = vertex_grid[-1]
@@ -623,15 +706,90 @@ class MESH_OT_bridge_plus(bpy.types.Operator):
         # Clamp the number of cuts to the number of vertices in the last layer.
         cuts = max(last_layer_index, cuts) # len(vertex_grid)
         extra_cuts = cuts - last_layer_index + 1
+        
+        # Calculate path_start_t for recursive custom_bridge call
+        # We've created last_layer_index layers, so we're at t = last_layer_index / (cuts + 1) in the path
+        path_start_t_for_extra = last_layer_index / (cuts + 1) if cuts > 0 else 0.0
 
         # Create virtual lines along both lines, this lines should cut the line0 and line1 at the same t value.
+        # If we have a path guide, use it to curve the bridge instead of straight lines.
         slice_lines = []
-        for i in range(cuts):
-            t = (i + 1) / (cuts + 1)
-            slice_lines.append((
-                self.sample_point_in_line(*line0, t),
-                self.sample_point_in_line(*line1, t)
-            ))
+        if use_path_guide:
+            # Parameterize the path by arc length
+            path_points = self.draw_path
+            path_cumulative_lengths = [0.0]
+            total_path_length = 0.0
+            for i in range(1, len(path_points)):
+                segment_length = (path_points[i] - path_points[i-1]).length
+                total_path_length += segment_length
+                path_cumulative_lengths.append(total_path_length)
+            
+            if total_path_length > 0:
+                # Helper function to sample a point along the path at parameter t (0 to 1)
+                def sample_path_point(t_param):
+                    target_distance = t_param * total_path_length
+                    # Find which segment contains this distance
+                    segment_idx = 0
+                    for j in range(1, len(path_cumulative_lengths)):
+                        if path_cumulative_lengths[j] >= target_distance:
+                            segment_idx = j - 1
+                            break
+                    # Interpolate within the segment
+                    seg_start_dist = path_cumulative_lengths[segment_idx]
+                    seg_end_dist = path_cumulative_lengths[segment_idx + 1]
+                    seg_length = seg_end_dist - seg_start_dist
+                    if seg_length > 0:
+                        seg_t = (target_distance - seg_start_dist) / seg_length
+                        seg_t = max(0.0, min(1.0, seg_t))
+                        return path_points[segment_idx].lerp(path_points[segment_idx + 1], seg_t)
+                    else:
+                        return path_points[segment_idx]
+                
+                # Calculate the center points of the start and end edge loops
+                center_start = v0_small.co.lerp(v1_small.co, 0.5)
+                center_end = v0_large.co.lerp(v1_large.co, 0.5)
+                
+                # Calculate the path's start and end points
+                path_start = path_points[0]
+                path_end = path_points[-1]
+                
+                # Calculate the translation from straight line to path
+                straight_start = center_start
+                straight_end = center_end
+                
+                for i in range(cuts):
+                    t = (i + 1) / (cuts + 1)
+                    
+                    # Sample point along the path (this is the center of the bridge at this slice)
+                    path_center = sample_path_point(t)
+                    
+                    # Calculate where we would be on the straight line
+                    straight_center = straight_start.lerp(straight_end, t)
+                    
+                    # Calculate the offset from straight line to path
+                    path_offset = path_center - straight_center
+                    
+                    # Calculate the straight line slice endpoints
+                    straight_slice_start = self.sample_point_in_line(*line0, t)
+                    straight_slice_end = self.sample_point_in_line(*line1, t)
+                    
+                    # Apply the path offset to follow the curve
+                    slice_start = straight_slice_start + path_offset
+                    slice_end = straight_slice_end + path_offset
+                    
+                    slice_lines.append((slice_start, slice_end))
+            else:
+                # Path has zero length, fall back to straight lines
+                use_path_guide = False
+        
+        if not use_path_guide:
+            # No path guide or path processing failed, use straight lines
+            for i in range(cuts):
+                t = (i + 1) / (cuts + 1)
+                slice_lines.append((
+                    self.sample_point_in_line(*line0, t),
+                    self.sample_point_in_line(*line1, t)
+                ))
 
         global debug_main_lines, debug_crossed_lines
         debug_main_lines = (line0, line1)
@@ -685,7 +843,7 @@ class MESH_OT_bridge_plus(bpy.types.Operator):
                     if e not in last_cut_edges and len(e.link_faces) == 1 and e.verts[0] in last_cut_verts and e.verts[1] in last_cut_verts:
                         last_cut_edges.append(e)
 
-            ret = self.custom_bridge(bm, edges_small=last_cut_edges, edges_large=edges_large, cuts=extra_cuts, smoothness=smoothness)
+            ret = self.custom_bridge(bm, edges_small=last_cut_edges, edges_large=edges_large, cuts=extra_cuts, smoothness=smoothness, path_start_t=path_start_t_for_extra)
             if ret and 'faces' in ret:
                 new_faces.extend(ret['faces'])
             else:
