@@ -7,6 +7,7 @@ import gpu
 from gpu_extras.batch import batch_for_shader
 
 from .config import TRANSITION_PATTERNS
+from .tool import BridgePlusTool, LINE_SHADER
 
 from typing import List, Set, Tuple
 from collections import defaultdict
@@ -16,6 +17,7 @@ from math import degrees, sin
 
 debug_main_lines = []
 debug_crossed_lines = []
+
 
 
 class MESH_OT_bridge_plus_debug(bpy.types.Operator):
@@ -105,7 +107,7 @@ class MESH_OT_bridge_plus(bpy.types.Operator):
         ],
         default='CLOSEST_POINT'
     )
-    
+
     offset: bpy.props.FloatProperty(
         name="Projection Offset",
         description="Offset from the surface (only for Closest-Point projection)",
@@ -117,6 +119,140 @@ class MESH_OT_bridge_plus(bpy.types.Operator):
         description="Use only quads for bridging (uses poles for transitions between different edge counts)",
         default=True
     )
+
+    use_tool: bpy.props.BoolProperty(
+        name="Use Tool",
+        description="Internal property used when we use this operator from a tool",
+        default=False,
+        options={'SKIP_SAVE', 'SKIP_PRESET', 'HIDDEN'}
+    )
+
+    def invoke(self, context: bpy.types.Context, event: bpy.types.Event):
+        print(event.type, event.value)
+        # Check if the tool is active (keymap properties don't get passed to operators)
+        # Import here to avoid circular imports
+        is_tool_active = BridgePlusTool.is_active
+
+        # Use tool mode if use_tool is explicitly set OR if the tool is active
+        if self.use_tool or is_tool_active:
+            bpy.ops.mesh.select_all(action='DESELECT')
+            bpy.ops.mesh.select_mode(type='EDGE')
+            if not BridgePlusTool.select_hovered_edge_loops(context):
+                self.report({'ERROR'}, "No edge loops hovered")
+                return {'CANCELLED'}
+            if context.window_manager.modal_handler_add(self):
+                self.start_modal(context, event)
+                return {'RUNNING_MODAL'}
+            return {'CANCELLED'}
+        print("Not using tool")
+        return self.execute(context)
+
+    def start_modal(self, context: bpy.types.Context, event: bpy.types.Event):
+        self.mouse_start = Vector((event.mouse_region_x, event.mouse_region_y))
+        self.mouse_current = self.mouse_start.copy()
+        self.draw_path = []  # 3D world-space points
+        self.draw_path_2d = []  # 2D pixel-space points
+        self._context = context  # Store context for draw handler
+        self._draw_handler_2d = context.space_data.draw_handler_add(self.modal_draw_post_pixel, (), 'WINDOW', 'POST_PIXEL')
+
+    def stop_modal(self, context: bpy.types.Context, cancel: bool = False):
+        context.space_data.draw_handler_remove(self._draw_handler_2d, 'WINDOW')
+        del self._draw_handler_2d
+
+    def modal(self, context: bpy.types.Context, event: bpy.types.Event):
+        if event.type in {'RIGHTMOUSE', 'ESC'}:
+            self.stop_modal(context, cancel=True)
+            return {'CANCELLED'}
+
+        if event.type == 'LEFTMOUSE':
+            if event.value == 'PRESS':
+                
+                return {'RUNNING_MODAL'}
+            elif event.value == 'RELEASE':
+                if BridgePlusTool.select_hovered_edge_loops(context):
+                    self.commit(context)
+                self.stop_modal(context, cancel=False)
+                return {'FINISHED'}
+
+        elif event.type in {'MOUSEMOVE', 'INBETWEEN_MOUSEMOVE'}:
+            mouse_current = Vector((event.mouse_region_x, event.mouse_region_y))
+            # Delta mouse for a movement threshold of 6px.
+            delta_mouse = mouse_current - self.mouse_current
+            if delta_mouse.length > 6:
+                self.mouse_current = mouse_current
+                # Raycast for a new point.
+                hit, position, normal, index, object, matrix = BridgePlusTool._scene_raycast(context, self.mouse_current)
+                if hit:
+                    self.draw_path.append(position)  # Store 3D point
+                    self.draw_path_2d.append(mouse_current.copy())  # Store 2D pixel point
+                context.region.tag_redraw()
+
+        return {'PASS_THROUGH'}
+
+    def modal_draw_post_pixel(self):
+        if not self.draw_path_2d or len(self.draw_path_2d) < 2:
+            return
+        
+        # Calculate cumulative distances along the 2D path
+        cumulative_distances = [0.0]
+        total_length = 0.0
+        for i in range(1, len(self.draw_path_2d)):
+            segment_length = (self.draw_path_2d[i] - self.draw_path_2d[i-1]).length
+            total_length += segment_length
+            cumulative_distances.append(total_length)
+        
+        if total_length == 0:
+            return
+        
+        # Resample the path with evenly spaced points (one per 10 pixels)
+        target_spacing = 10.0  # pixels
+        resampled_2d = []
+        
+        # Always start with the first point
+        resampled_2d.append(self.draw_path_2d[0])
+        
+        # Sample points at regular intervals
+        current_distance = target_spacing
+        while current_distance < total_length:
+            # Find which segment contains this distance
+            segment_idx = 0
+            for i in range(1, len(cumulative_distances)):
+                if cumulative_distances[i] >= current_distance:
+                    segment_idx = i - 1
+                    break
+            
+            # Calculate interpolation parameter within the segment
+            seg_start_dist = cumulative_distances[segment_idx]
+            seg_end_dist = cumulative_distances[segment_idx + 1]
+            seg_length = seg_end_dist - seg_start_dist
+            
+            if seg_length > 0:
+                t = (current_distance - seg_start_dist) / seg_length
+                t = max(0.0, min(1.0, t))  # Clamp to [0, 1]
+                
+                # Interpolate in 2D pixel space
+                sample_2d = self.draw_path_2d[segment_idx].lerp(self.draw_path_2d[segment_idx + 1], t)
+                resampled_2d.append(sample_2d)
+            
+            current_distance += target_spacing
+        
+        # Always include the last point
+        if len(resampled_2d) == 0 or (resampled_2d[-1] - self.draw_path_2d[-1]).length > 0.001:
+            resampled_2d.append(self.draw_path_2d[-1])
+        
+        if len(resampled_2d) < 2:
+            return
+        
+        # Draw the resampled path using LINE_SHADER
+        batch = batch_for_shader(LINE_SHADER, 'LINES', {'pos': resampled_2d})
+        LINE_SHADER.bind()
+        LINE_SHADER.uniform_float("viewportSize", gpu.state.viewport_get()[2:])
+        LINE_SHADER.uniform_float("lineWidth", 6)
+        LINE_SHADER.uniform_float('color', (.1, 1, .6, .8))
+        batch.draw(LINE_SHADER)
+
+    def commit(self, context: bpy.types.Context):
+        self.execute(context)
 
     def execute(self, context):
         obj = context.edit_object
