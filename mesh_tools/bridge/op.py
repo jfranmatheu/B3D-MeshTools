@@ -1229,19 +1229,21 @@ class MESH_OT_bridge_plus(bpy.types.Operator):
                 else:
                     face_verts = [v.index for v in face_verts]
                 quad_indices = [previz_vert_index[v_index] for v_index in face_verts]
-                previz_indices.append(
-                    [quad_indices[0], quad_indices[1], quad_indices[2]]
-                )
-                previz_indices.append(
-                    [quad_indices[0], quad_indices[2], quad_indices[3]]
-                )
+                # Triangulate for drawing
+                if len(quad_indices) == 3:
+                    previz_indices.append([quad_indices[0], quad_indices[1], quad_indices[2]])
+                elif len(quad_indices) == 4:
+                    previz_indices.append([quad_indices[0], quad_indices[1], quad_indices[2]])
+                    previz_indices.append([quad_indices[0], quad_indices[2], quad_indices[3]])
+                else: # Fan triangulation
+                    for k in range(1, len(quad_indices) - 1):
+                        previz_indices.append([quad_indices[0], quad_indices[k], quad_indices[k+1]])
+
                 # real_face_indices.append([v.index for v in face_verts])
-                previz_edge_indices.extend([
-                    (quad_indices[0], quad_indices[1]),
-                    (quad_indices[1], quad_indices[2]),
-                    (quad_indices[2], quad_indices[3]),
-                    (quad_indices[3], quad_indices[0]),
-                ])
+                
+                # Add edges for wireframe
+                for k in range(len(quad_indices)):
+                    previz_edge_indices.append((quad_indices[k], quad_indices[(k + 1) % len(quad_indices)]))
 
             if extra_cuts > 0:
                 last_cut_verts: List[Tuple[int, Vector]] = new_verts[-len(last_layer_vertices):]
