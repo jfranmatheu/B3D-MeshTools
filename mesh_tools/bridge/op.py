@@ -320,15 +320,15 @@ class MESH_OT_bridge_plus(bpy.types.Operator):
         if not hasattr(self, 'first_edge_loop') or not self.first_edge_loop:
             self.draw_previz_bridge = None
             return
-        
+
         if not hasattr(self, 'second_edge_loop') or not self.second_edge_loop:
             self.draw_previz_bridge = None
             return
-        
+
         if self.second_edge_loop == self.first_edge_loop:
             self.draw_previz_bridge = None
             return
-        
+
         # Get context if not provided (for draw handler)
         if context is None:
             import bpy
@@ -346,19 +346,18 @@ class MESH_OT_bridge_plus(bpy.types.Operator):
                 self.smoothness,
                 _use_previz=True
             )
-
             if ret and 'coords' in ret and 'face_indices' in ret and 'edge_indices' in ret:
                 self.draw_previz_bridge = ret
-                print(f"PREVIZ: Computed preview - {len(ret['coords'])} verts, {len(ret['face_indices'])} faces, {len(ret['edge_indices'])} edges") 
+                # print(f"PREVIZ: Computed preview - {len(ret['coords'])} verts, {len(ret['face_indices'])} faces, {len(ret['edge_indices'])} edges") 
             else:
-                print(f"PREVIZ: No valid result from virtual_bridge_quads_e5_e3: {ret}")
+                # print(f"PREVIZ: No valid result from virtual_bridge_quads_e5_e3: {ret}")
                 self.draw_previz_bridge = None
         except Exception as e:
             print(f"Error computing preview bridge: {e}")
             import traceback
             traceback.print_exc()
             self.draw_previz_bridge = None
-    
+
     def modal_draw_previz_post_view(self):
         """Draw preview bridge geometry"""
         if not hasattr(self, 'draw_previz_bridge') or not self.draw_previz_bridge:
@@ -375,9 +374,6 @@ class MESH_OT_bridge_plus(bpy.types.Operator):
         if not verts_co:
             return
 
-        print("ALL POSITIONS:", verts_co)
-        print("ALL FACES:", faces_indices)
-        print("ALL EDGES:", edge_indices)
 
         # Draw using TRIS in 3D space
         gpu.state.blend_set('ALPHA')
