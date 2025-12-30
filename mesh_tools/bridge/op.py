@@ -1093,11 +1093,7 @@ class MESH_OT_bridge_plus(bpy.types.Operator):
                 # Calculate the center points of the start and end edge loops
                 center_start = v0_small.co.lerp(v1_small.co, 0.5)
                 center_end = v0_large.co.lerp(v1_large.co, 0.5)
-                
-                # Calculate the path's start and end points
-                path_start = path_points[0]
-                path_end = path_points[-1]
-                
+
                 # Calculate the translation from straight line to path
                 straight_start = center_start
                 straight_end = center_end
@@ -1188,19 +1184,6 @@ class MESH_OT_bridge_plus(bpy.types.Operator):
 
         # Create faces. --------------------------------------------------- #
         if _use_previz:
-            '''if extra_cuts > 0:
-                # For the rest of remaining cuts until the last edge_loop/layer,
-                # we will extrude quads to close the bridge.
-                point_count = len(last_layer_vertices)
-                for i in range(extra_cuts):
-                    # point_count samples along the rest of cutting lines.
-                    slice_line = slice_lines[layer_index+i-1]
-                    for j in range(point_count):
-                        slice_t = j / (point_count - 1)
-                        point = self.sample_point_in_line(*slice_line, slice_t)
-                        new_verts.append((v_index_off, point.copy())) # (v_index_start + v_index_off + index, point))
-                        v_index_off += 1'''
-
             # Only for previz.
             previz_coords = []
             previz_indices = []
