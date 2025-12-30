@@ -7,7 +7,7 @@ import gpu
 from gpu_extras.batch import batch_for_shader
 
 from .config import TRANSITION_PATTERNS
-from .tool import BridgePlusTool, LINE_SHADER
+from .tool import BridgePlusTool, LINE_SHADER, EdgeCandidate, EdgeLoopCandidate
 
 from typing import List, Set, Tuple
 from collections import defaultdict
@@ -135,6 +135,16 @@ class MESH_OT_bridge_plus(bpy.types.Operator):
 
         # Use tool mode if use_tool is explicitly set OR if the tool is active
         if self.use_tool or is_tool_active:
+            tool_mode = context.scene.bridge_tool_settings.mode
+            
+            # For PREVIZ mode, we don't need to select on invoke - we'll select on first click
+            if tool_mode == 'PREVIZ':
+                if context.window_manager.modal_handler_add(self):
+                    self.start_modal(context, event)
+                    return {'RUNNING_MODAL'}
+                return {'CANCELLED'}
+            
+            # For DRAW_PATH and CLICK_CLICK, select first edge loop on invoke
             bpy.ops.mesh.select_all(action='DESELECT')
             bpy.ops.mesh.select_mode(type='EDGE')
             if not BridgePlusTool.select_hovered_edge_loops(context):
@@ -150,28 +160,73 @@ class MESH_OT_bridge_plus(bpy.types.Operator):
     def start_modal(self, context: bpy.types.Context, event: bpy.types.Event):
         self.mouse_start = Vector((event.mouse_region_x, event.mouse_region_y))
         self.mouse_current = self.mouse_start.copy()
-        self.draw_path = []  # 3D world-space points
-        self.draw_path_2d = []  # 2D pixel-space points
-        self._context = context  # Store context for draw handler
-        self._draw_handler_2d = context.space_data.draw_handler_add(self.modal_draw_post_pixel, (), 'WINDOW', 'POST_PIXEL')
+        tool_mode = context.scene.bridge_tool_settings.mode
+        
+        if tool_mode == 'DRAW_PATH':
+            self.use_draw_path = True
+            self.draw_path = []  # 3D world-space points
+            self.draw_path_2d = []  # 2D pixel-space points
+            self._draw_path_handler_2d = context.space_data.draw_handler_add(self.modal_draw_path_post_pixel, (), 'WINDOW', 'POST_PIXEL')
+            context.region.tag_redraw()
+        elif tool_mode == 'CLICK_CLICK':
+            self.use_draw_path = False
+            self.first_edge_loop_selected = False
+            self.second_edge_loop_selected = False
+        elif tool_mode == 'PREVIZ':
+            self.use_draw_path = False
+            # First edge loop will be selected on first click
+            self.first_edge_loop_selected = False
+            self.first_edge_loop = None  # Store first edge loop
+            self.second_edge_loop = None  # Store second edge loop (hovered)
+            self.draw_previz_bridge = None  # Preview bridge data
+            self._last_hovered_for_previz = None  # Track last hovered edge loop for preview
+            # Draw handler - instance method automatically has access to self
+            self._draw_previz_handler = context.space_data.draw_handler_add(self.modal_draw_previz_post_view, (), 'WINDOW', 'POST_VIEW')
+            print("Draw previz handler added")
+            context.region.tag_redraw()
 
     def stop_modal(self, context: bpy.types.Context, cancel: bool = False):
-        context.space_data.draw_handler_remove(self._draw_handler_2d, 'WINDOW')
-        del self._draw_handler_2d
+        if hasattr(self, 'use_draw_path') and self.use_draw_path:
+            context.space_data.draw_handler_remove(self._draw_path_handler_2d, 'WINDOW')
+            del self._draw_path_handler_2d
+            context.region.tag_redraw()
+        # Clear PREVIZ state
+        if hasattr(self, '_draw_previz_handler') and self._draw_previz_handler:
+            context.space_data.draw_handler_remove(self._draw_previz_handler, 'WINDOW')
+            del self._draw_previz_handler
+            context.region.tag_redraw()
+        if hasattr(self, 'draw_previz_bridge'):
+            self.draw_previz_bridge = None
 
     def modal(self, context: bpy.types.Context, event: bpy.types.Event):
         if event.type in {'RIGHTMOUSE', 'ESC'}:
             self.stop_modal(context, cancel=True)
             return {'CANCELLED'}
 
+        tool_mode = context.scene.bridge_tool_settings.mode
+        
+        if tool_mode == 'DRAW_PATH':
+            ret = self.modal_update_draw_path(context, event)
+        elif tool_mode == 'CLICK_CLICK':
+            ret = self.modal_update_click_click(context, event)
+        elif tool_mode == 'PREVIZ':
+            ret = self.modal_update_previz(context, event)
+        else:
+            ret = None
+
+        if ret:
+            if 'FINISHED' in ret or 'CANCELLED' in ret:
+                self.stop_modal(context, cancel='CANCELLED' in ret)
+            return ret
+        return {'PASS_THROUGH'}
+
+    def modal_update_draw_path(self, context: bpy.types.Context, event: bpy.types.Event):
         if event.type == 'LEFTMOUSE':
             if event.value == 'PRESS':
-                
                 return {'RUNNING_MODAL'}
             elif event.value == 'RELEASE':
                 if BridgePlusTool.select_hovered_edge_loops(context):
                     self.commit(context)
-                self.stop_modal(context, cancel=False)
                 return {'FINISHED'}
 
         elif event.type in {'MOUSEMOVE', 'INBETWEEN_MOUSEMOVE'}:
@@ -187,9 +242,172 @@ class MESH_OT_bridge_plus(bpy.types.Operator):
                     self.draw_path_2d.append(mouse_current.copy())  # Store 2D pixel point
                 context.region.tag_redraw()
 
-        return {'PASS_THROUGH'}
+    def modal_update_click_click(self, context: bpy.types.Context, event: bpy.types.Event):
+        """Handle CLICK_CLICK mode: first click selects first edge loop, second click selects second and bridges"""
+        if event.type == 'LEFTMOUSE':
+            if event.value == 'PRESS':
+                return {'RUNNING_MODAL'}
+            elif event.value == 'RELEASE':
+                if not self.first_edge_loop_selected:
+                    # First click - select first edge loop
+                    if BridgePlusTool.select_hovered_edge_loops(context):
+                        self.first_edge_loop_selected = True
+                        return {'RUNNING_MODAL'}
+                else:
+                    # Second click - select second edge loop and bridge
+                    if BridgePlusTool.select_hovered_edge_loops(context):
+                        self.commit(context)
+                        return {'FINISHED'}
+        return None
+    
+    def modal_update_previz(self, context: bpy.types.Context, event: bpy.types.Event):
+        """Handle PREVIZ mode: first click selects first edge loop, then preview updates on hover"""
+        if event.type == 'LEFTMOUSE':
+            if event.value == 'PRESS':
+                return {'RUNNING_MODAL'}
+            elif event.value == 'RELEASE':
+                if not self.first_edge_loop_selected:
+                    # First click - select and store first edge loop
+                    if BridgePlusTool._hovered_edge_loop:
+                        bpy.ops.mesh.select_all(action='DESELECT')
+                        BridgePlusTool.select_edge_loop(context, BridgePlusTool._hovered_edge_loop)
+                        self.first_edge_loop = BridgePlusTool._hovered_edge_loop
+                        self.first_edge_loop_selected = True
+                        self.second_edge_loop = None
+                        context.region.tag_redraw()
+                        print("First Edge-Loop Selected!")
+                        return {'RUNNING_MODAL'}
+                else:
+                    # Second click - commit the bridge
+                    if BridgePlusTool.select_hovered_edge_loops(context):
+                        print("Commit!")
+                        self.commit(context)
+                        return {'FINISHED'}
+        
+        # Update preview on mouse move when hovering over different edge loops
+        if event.type in {'MOUSEMOVE', 'INBETWEEN_MOUSEMOVE'}:
+            if self.first_edge_loop_selected and self.first_edge_loop:
+                current_hovered = BridgePlusTool._hovered_edge_loop
+                # Check if we have a valid and different second edge loop
+                if current_hovered and current_hovered != self.first_edge_loop:
+                    # If second edge loop changed, update selection and preview
+                    if current_hovered != self.second_edge_loop:
+                        print("Second Edge-Loop on hover!")
+                        # Clear previous selection
+                        bpy.ops.mesh.select_all(action='DESELECT')
+                        # Ensure first edge loop is selected
+                        BridgePlusTool.select_edge_loop(context, self.first_edge_loop)
+                        # Select second edge loop
+                        BridgePlusTool.select_edge_loop(context, current_hovered)
+                        self.second_edge_loop = current_hovered
+                        # Update preview
+                        self.update_previz_bridge(context)
+                        context.region.tag_redraw()
+                elif not current_hovered or current_hovered == self.first_edge_loop:
+                    # No valid hover or same as first, clear second and preview
+                    if self.second_edge_loop:
+                        print("Reset Edge-Loop Selection to first one!")
+                        bpy.ops.mesh.select_all(action='DESELECT')
+                        BridgePlusTool.select_edge_loop(context, self.first_edge_loop)
+                        self.second_edge_loop = None
+                        self.draw_previz_bridge = None
+                        context.region.tag_redraw()
+        
+        return None
+    
+    def update_previz_bridge(self, context: bpy.types.Context = None):
+        """Compute preview bridge geometry without adding to BMesh"""
+        if not hasattr(self, 'first_edge_loop') or not self.first_edge_loop:
+            self.draw_previz_bridge = None
+            return
+        
+        if not hasattr(self, 'second_edge_loop') or not self.second_edge_loop:
+            self.draw_previz_bridge = None
+            return
+        
+        if self.second_edge_loop == self.first_edge_loop:
+            self.draw_previz_bridge = None
+            return
+        
+        # Get context if not provided (for draw handler)
+        if context is None:
+            import bpy
+            context = bpy.context
 
-    def modal_draw_post_pixel(self):
+        try:
+            bm = BridgePlusTool.ensure_bmesh(context)
+            # Use virtual bridge computation that works with EdgeLoopCandidate
+            ret = self.custom_bridge_quads_e5_e3(
+                context,
+                bm,
+                self.first_edge_loop,
+                self.second_edge_loop,
+                self.cuts,
+                self.smoothness,
+                _use_previz=True
+            )
+
+            if ret and 'coords' in ret and 'face_indices' in ret and 'edge_indices' in ret:
+                self.draw_previz_bridge = ret
+                print(f"PREVIZ: Computed preview - {len(ret['coords'])} verts, {len(ret['face_indices'])} faces, {len(ret['edge_indices'])} edges") 
+            else:
+                print(f"PREVIZ: No valid result from virtual_bridge_quads_e5_e3: {ret}")
+                self.draw_previz_bridge = None
+        except Exception as e:
+            print(f"Error computing preview bridge: {e}")
+            import traceback
+            traceback.print_exc()
+            self.draw_previz_bridge = None
+    
+    def modal_draw_previz_post_view(self):
+        """Draw preview bridge geometry"""
+        if not hasattr(self, 'draw_previz_bridge') or not self.draw_previz_bridge:
+            return
+
+        verts_co = self.draw_previz_bridge.get('coords')
+        faces_indices = self.draw_previz_bridge.get('face_indices')
+        edge_indices = self.draw_previz_bridge.get('edge_indices')
+
+        if not verts_co or not faces_indices or not edge_indices:
+            return
+
+
+        if not verts_co:
+            return
+
+        print("ALL POSITIONS:", verts_co)
+        print("ALL FACES:", faces_indices)
+        print("ALL EDGES:", edge_indices)
+
+        # Draw using TRIS in 3D space
+        gpu.state.blend_set('ALPHA')
+        gpu.state.depth_test_set('NONE')
+        gpu.state.depth_mask_set(False)
+
+        shader = gpu.shader.from_builtin('UNIFORM_COLOR')
+        shader.bind()
+
+        batch = batch_for_shader(shader, 'TRIS', {'pos': verts_co}, indices=faces_indices)
+        shader.uniform_float("color", (0.1, 1.0, 0.6, 0.3))
+        batch.draw(shader)
+
+        line_shader = gpu.shader.from_builtin('POLYLINE_UNIFORM_COLOR')
+        edge_batch = batch_for_shader(line_shader, 'LINES', {'pos': verts_co}, indices=edge_indices)
+        line_shader.uniform_float("viewportSize", gpu.state.viewport_get()[2:])
+        line_shader.uniform_float("lineWidth", 4.5)
+        line_shader.uniform_float("color", (0.08, 0.08, 0.08, 0.7))
+        edge_batch.draw(line_shader)
+     
+        batch_points = batch_for_shader(shader, 'POINTS', {'pos': verts_co})
+        shader.uniform_float("color", (0.7, .7, .7, .92))
+        gpu.state.point_size_set(5.0)
+        batch_points.draw(shader)
+        gpu.state.point_size_set(1.0)
+
+        gpu.state.blend_set('NONE')
+        gpu.state.depth_mask_set(True)
+
+    def modal_draw_path_post_pixel(self):
         if not self.draw_path_2d or len(self.draw_path_2d) < 2:
             return
         
@@ -295,7 +513,7 @@ class MESH_OT_bridge_plus(bpy.types.Operator):
             use_quads_only = self.only_quads and (count_small != count_large)
 
             if use_quads_only:
-                ret = self.custom_bridge_quads_e5_e3(bm, l1_edges, l2_edges, self.cuts, self.smoothness)
+                ret = self.custom_bridge_quads_e5_e3(context, bm, l1_edges, l2_edges, self.cuts, self.smoothness)
             else:
                 ret = self.custom_bridge(bm, l1_edges, l2_edges, self.cuts, self.smoothness)
 
@@ -364,7 +582,7 @@ class MESH_OT_bridge_plus(bpy.types.Operator):
 
         return {'FINISHED'}
 
-    def custom_bridge(self, bm, edges_small, edges_large, cuts, smoothness, path_start_t=0.0):
+    def custom_bridge(self, bm, edges_small: List[BMEdge] | List[Tuple[int, Vector]], edges_large: List[BMEdge] | EdgeLoopCandidate, cuts: int, smoothness: float, path_start_t=0.0):
         """
         Custom bridging for unequal edge counts.
         Creates a transition where the smaller loop connects to a grid 
@@ -594,13 +812,140 @@ class MESH_OT_bridge_plus(bpy.types.Operator):
                 except ValueError: pass
 
         return {'faces': new_faces}
+    
+    def previz_bridge(self, bm, first_edge_loop, last_edge_loop, cuts, smoothness, previz_vert_index, index_offset, path_start_t=0.0):
+        """
+        Compute previz bridge geometry (vertices and faces) without modifying BMesh.
+        Generates intermediate loops and connects them with virtual faces.
+        
+        Args:
+            bm: BMesh object (used for access if needed, but primarily coord based)
+            first_edge_loop: List of (v_index, Vector) from previous steps
+            last_edge_loop: EdgeLoopCandidate or List[BMEdge] (target loop)
+            cuts: Number of intermediate cuts
+            smoothness: Interpolation smoothness (currently linear for previz)
+            previz_vert_index: Dict mapping original v_indices to previz_coords indices
+            index_offset: Starting index for new vertices in the global previz buffer
+            path_start_t: Path interpolation offset (unused in simple linear previz)
+            
+        Returns:
+            Dict with 'coords', 'face_indices', 'edge_indices', 'real_face_indices'
+        """
+        # 1. Setup Loop A (Start)
+        loop_a_coords = [item[1] for item in first_edge_loop]
+        try:
+            loop_a_indices = [previz_vert_index[item[0]] for item in first_edge_loop]
+        except KeyError:
+            print("PREVIZ ERROR: Loop A vertex index mismatch")
+            return None
 
-    def custom_bridge_quads_e5_e3(self, bm: bmesh.types.BMesh, edges_small: List[BMEdge], edges_large: List[BMEdge], cuts: int, smoothness: float):
+        # 2. Setup Loop B (End)
+        if hasattr(last_edge_loop, 'edges'):
+            edges_b = last_edge_loop.edges
+        else:
+            edges_b = last_edge_loop
+            
+        loop_b_verts, is_closed_b = self.get_ordered_verts(edges_b)
+        
+        # Align B to A
+        # Create proxy objects with .co for align_loops compatibility
+        class VProxy:
+            def __init__(self, co): self.co = co
+        loop_a_proxies = [VProxy(co) for co in loop_a_coords]
+        
+        # Align Loop B to Loop A direction/start
+        loop_b_aligned = self.align_loops(loop_a_proxies, loop_b_verts, is_closed_b)
+        loop_b_coords = [v.co for v in loop_b_aligned]
+        
+        # Ensure Loop B size matches Loop A (simple resampling if needed, but assuming match for now)
+        # If sizes differ, we might need to stretch/resample Loop B to match Loop A count
+        if len(loop_b_coords) != len(loop_a_coords):
+            # Simple resampling could be added here if needed
+            pass
+            
+        # 3. Generate Intermediate Loops
+        new_coords_flat = []
+        intermediate_loops_indices = []
+        current_global_index = index_offset
+        
+        # Generate 'cuts' number of intermediate loops
+        for i in range(cuts):
+            t = (i + 1) / (cuts + 1)
+            loop_indices = []
+            for j in range(len(loop_a_coords)):
+                pA = loop_a_coords[j]
+                pB = loop_b_coords[j % len(loop_b_coords)]
+                # Linear interpolation for previz speed/simplicity
+                p = pA.lerp(pB, t)
+                new_coords_flat.append(p)
+                loop_indices.append(current_global_index)
+                current_global_index += 1
+            intermediate_loops_indices.append(loop_indices)
+            
+        # Add Loop B as the final loop in coords (so we can draw faces to it)
+        loop_b_indices = []
+        for co in loop_b_coords:
+            new_coords_flat.append(co)
+            loop_b_indices.append(current_global_index)
+            current_global_index += 1
+            
+        # 4. Generate Faces and Edges
+        # Sequence of loops: A -> Inter 1 -> ... -> Inter N -> B
+        all_loops = [loop_a_indices] + intermediate_loops_indices + [loop_b_indices]
+        
+        faces = []
+        edges = []
+        
+        for l in range(len(all_loops) - 1):
+            curr_row = all_loops[l]
+            next_row = all_loops[l+1]
+            count = max(len(curr_row), len(next_row))
+            
+            for i in range(count):
+                idx_curr = i % len(curr_row)
+                idx_next = i % len(next_row)
+                
+                # Current quad verts
+                v1 = curr_row[idx_curr]
+                v2 = curr_row[(idx_curr + 1) % len(curr_row)]
+                v3 = next_row[(idx_next + 1) % len(next_row)]
+                v4 = next_row[idx_next]
+                
+                # Split Quad (v1, v2, v3, v4) into Tris for drawing
+                # Tri 1: v1, v2, v4
+                # Tri 2: v2, v3, v4
+                faces.append([v1, v2, v4])
+                faces.append([v2, v3, v4])
+                
+                # Edges for wireframe
+                edges.append([v1, v2]) # Horizontal
+                edges.append([v1, v4]) # Vertical
+        
+        # Add last loop horizontal edges
+        last_row = all_loops[-1]
+        for i in range(len(last_row)):
+            v1 = last_row[i]
+            v2 = last_row[(i + 1) % len(last_row)]
+            edges.append([v1, v2])
+            
+        return {
+            'coords': new_coords_flat,
+            'face_indices': faces,
+            'edge_indices': edges,
+            'real_face_indices': [] # Not needed for previz drawing
+        }
+
+    def custom_bridge_quads_e5_e3(self, context: bpy.types.Context, bm: bmesh.types.BMesh, edges_small: List[BMEdge] | EdgeLoopCandidate, edges_large: List[BMEdge] | EdgeLoopCandidate, cuts: int, smoothness: float, _use_previz: bool = False):
         """
         Bridge with only quads using poles (E5/E3) for smooth transitions.
         E5 poles (valence 5) increase edge count by +1
         E3 poles (valence 3) decrease edge count by -1
         """
+        # If input is EdgeLoopCandidaes, get the real BMesh edges..
+        if isinstance(edges_small, EdgeLoopCandidate):
+            edges_small = edges_small.get_bm_edges(bm)
+            edges_large = edges_large.get_bm_edges(bm)
+
         # Find the ideal the pattern of the edge count for both ends.
         small_count = len(edges_small)
         large_count = len(edges_large)
@@ -803,7 +1148,12 @@ class MESH_OT_bridge_plus(bpy.types.Operator):
         ## print("slice_lines", slice_lines)
 
         # Add verts.
-        new_verts = first_layer_vertices
+        if _use_previz:
+            new_verts = [(index, v.co) for index, v in enumerate(first_layer_vertices)]
+        else:
+            new_verts = first_layer_vertices
+        v_index_off = len(new_verts)
+        # v_index_start = len(bm.verts) - 1
         for layer_index, vert_indices in enumerate(vertex_grid):
             if (layer_index == last_layer_index and extra_cuts == 0) or layer_index == 0:
                 continue
@@ -822,32 +1172,107 @@ class MESH_OT_bridge_plus(bpy.types.Operator):
                 ## print("\t- slice_position", slice_position)
                 ## print("\t- slice_t", slice_t)
                 ## print("\t- point", point)
-                new_verts.append(bm.verts.new(point))
+                if _use_previz:
+                    new_verts.append((v_index_off, point.copy())) # (v_index_start + v_index_off, point))
+                    v_index_off += 1
+                else:
+                    new_verts.append(bm.verts.new(point))
 
         if extra_cuts > 0:
             pass
         else:
-            new_verts.extend(last_layer_vertices)
-
-        # Create faces.
-        for face_index in face_indices:
-            new_faces.append(bm.faces.new([
-                new_verts[i] for i in face_index
-            ]))
-
-        if extra_cuts > 0:
-            last_cut_verts = new_verts[-len(last_layer_vertices):]
-            last_cut_edges = []
-            for v in last_cut_verts:
-                for e in v.link_edges:
-                    if e not in last_cut_edges and len(e.link_faces) == 1 and e.verts[0] in last_cut_verts and e.verts[1] in last_cut_verts:
-                        last_cut_edges.append(e)
-
-            ret = self.custom_bridge(bm, edges_small=last_cut_edges, edges_large=edges_large, cuts=extra_cuts, smoothness=smoothness, path_start_t=path_start_t_for_extra)
-            if ret and 'faces' in ret:
-                new_faces.extend(ret['faces'])
+            if _use_previz:
+                new_verts.extend([(v_index_off + index, v.co) for index, v in enumerate(last_layer_vertices)])
             else:
-                print("Error bridging extra cuts")
+                new_verts.extend(last_layer_vertices)
+
+        # Create faces. --------------------------------------------------- #
+        if _use_previz:
+            '''if extra_cuts > 0:
+                # For the rest of remaining cuts until the last edge_loop/layer,
+                # we will extrude quads to close the bridge.
+                point_count = len(last_layer_vertices)
+                for i in range(extra_cuts):
+                    # point_count samples along the rest of cutting lines.
+                    slice_line = slice_lines[layer_index+i-1]
+                    for j in range(point_count):
+                        slice_t = j / (point_count - 1)
+                        point = self.sample_point_in_line(*slice_line, slice_t)
+                        new_verts.append((v_index_off, point.copy())) # (v_index_start + v_index_off + index, point))
+                        v_index_off += 1'''
+
+            # Only for previz.
+            previz_coords = []
+            previz_indices = []
+            previz_edge_indices = []
+            real_face_indices = []
+            previz_vert_index = {}
+            mw = context.edit_object.matrix_world
+            index_offset = 0
+            for face_index in face_indices:
+                for i in face_index:
+                    v = new_verts[i]
+                    if isinstance(v, tuple):
+                        v_index, v_co = v
+                    else:
+                        v_index, v_co = v.index, v.co
+                    if v_index in previz_vert_index:
+                        continue
+                    previz_coords.append(mw @ v_co)
+                    previz_vert_index[v_index] = index_offset
+                    index_offset += 1
+
+            for face_index in face_indices:
+                face_verts = [new_verts[i] for i in face_index]
+                if isinstance(face_verts[0], tuple):
+                    face_verts = [v[0] for v in face_verts]
+                else:
+                    face_verts = [v.index for v in face_verts]
+                quad_indices = [previz_vert_index[v_index] for v_index in face_verts]
+                previz_indices.append(
+                    [quad_indices[0], quad_indices[1], quad_indices[2]]
+                )
+                previz_indices.append(
+                    [quad_indices[0], quad_indices[2], quad_indices[3]]
+                )
+                # real_face_indices.append([v.index for v in face_verts])
+                previz_edge_indices.extend([
+                    (quad_indices[0], quad_indices[1]),
+                    (quad_indices[1], quad_indices[2]),
+                    (quad_indices[2], quad_indices[3]),
+                    (quad_indices[3], quad_indices[0]),
+                ])
+
+            if extra_cuts > 0:
+                last_cut_verts: List[Tuple[int, Vector]] = new_verts[-len(last_layer_vertices):]
+                edges_large: EdgeLoopCandidate
+                ret = self.previz_bridge(bm, first_edge_loop=last_cut_verts, last_edge_loop=edges_large, cuts=extra_cuts, smoothness=smoothness, previz_vert_index=previz_vert_index, index_offset=len(previz_coords), path_start_t=path_start_t_for_extra)
+                if ret is not None:
+                    previz_coords.extend(ret['coords'])
+                    previz_indices.extend(ret['face_indices'])
+                    previz_edge_indices.extend(ret['edge_indices'])
+                    real_face_indices.extend(ret['real_face_indices'])
+
+            return {'coords': previz_coords, 'face_indices': previz_indices, 'edge_indices': previz_edge_indices, 'real_face_indices': real_face_indices}
+        else:
+            for face_index in face_indices:
+                new_faces.append(bm.faces.new([
+                    new_verts[i] for i in face_index
+                ]))
+
+            if extra_cuts > 0:
+                last_cut_verts = new_verts[-len(last_layer_vertices):]
+                last_cut_edges = []
+                for v in last_cut_verts:
+                    for e in v.link_edges:
+                        if e not in last_cut_edges and len(e.link_faces) == 1 and e.verts[0] in last_cut_verts and e.verts[1] in last_cut_verts:
+                            last_cut_edges.append(e)
+
+                ret = self.custom_bridge(bm, edges_small=last_cut_edges, edges_large=edges_large, cuts=extra_cuts, smoothness=smoothness, path_start_t=path_start_t_for_extra)
+                if ret and 'faces' in ret:
+                    new_faces.extend(ret['faces'])
+                else:
+                    print("Error bridging extra cuts")
 
         return {'faces': new_faces}
 

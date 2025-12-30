@@ -68,6 +68,10 @@ class EdgeLoopCandidate:
     draw_batch: GPUBatch = None
     hovered: bool = False
     color: Color = Color((1, 1, 0))
+    
+    @property
+    def edge_count(self):
+        return len(self.edges)
 
     def __hash__(self) -> int:
         return hash(tuple(self.edges))
@@ -81,6 +85,12 @@ class EdgeLoopCandidate:
             face_index=edge_cand.link_faces[0].index,
             face_normal=edge_cand.link_faces[0].normal.normalized()
         ))
+
+    def get_bm_verts(self, bm: BMesh) -> Set[BMVert]:
+        return {bm.verts[v_index] for edge in self.edges for v_index in edge.verts_indices}
+
+    def get_bm_edges(self, bm: BMesh) -> List[BMEdge]:
+        return [bm.edges[edge.index] for edge in self.edges]
 
     def setup_draw_batch(self):
         # Flatten the vertex coordinates: each edge has (Vector, Vector), we need a flat list
@@ -158,8 +168,9 @@ class BridgePlusTool(bpy.types.WorkSpaceTool):
         cls.is_active = False
         cls.potential_edge_loops = []
         cls.edge_to_edge_loop = None
-        context.space_data.draw_handler_remove(cls._draw_post_view_handler, 'WINDOW')
-        cls._draw_post_view_handler = None
+        if cls._draw_post_view_handler:
+            context.space_data.draw_handler_remove(cls._draw_post_view_handler, 'WINDOW')
+            cls._draw_post_view_handler = None
         # context.window_manager.draw_cursor_remove(cls._cursor_handler)
         # cls._cursor_handler = None
         context.window.cursor_set('DEFAULT')
@@ -202,11 +213,18 @@ class BridgePlusTool(bpy.types.WorkSpaceTool):
     def select_hovered_edge_loops(cls, context: bpy.types.Context) -> bool:
         if cls._hovered_edge_loop is None:
             return False
+        return cls.select_edge_loop(context, cls._hovered_edge_loop)
+    
+    @classmethod
+    def select_edge_loop(cls, context: bpy.types.Context, edge_loop_candidate: EdgeLoopCandidate) -> bool:
+        """Select a given edge loop candidate"""
+        if edge_loop_candidate is None:
+            return False
         bm = cls.ensure_bmesh(context)
         if bm is None or not bm.is_valid:
             return False
         try:
-            for edge in cls._hovered_edge_loop.edges:
+            for edge in edge_loop_candidate.edges:
                 bm.edges[edge.index].select_set(True)
         except Exception as e:
             print(e)
@@ -280,6 +298,7 @@ class BridgePlusTool(bpy.types.WorkSpaceTool):
         cls._hovered_edge_loop = hovered_edge_loop
         if hovered_edge_loop:
             hovered_edge_loop.hovered = True
+        
         context.region.tag_redraw()
 
     @classmethod
@@ -492,8 +511,11 @@ class BridgePlusTool(bpy.types.WorkSpaceTool):
         gpu.state.blend_set('NONE')
         gpu.state.depth_mask_set(False)
 
-    # def draw_settings(context, layout, tool):
-    #     settings = context.scene.bridge_plus_settings
+    @classmethod
+    def draw_settings(cls, context: bpy.types.Context, layout: bpy.types.UILayout, tool: WorkSpaceTool):
+        settings = context.scene.bridge_tool_settings
+        layout.prop(settings, "mode")
+    
 
 
 def on_tool_switch_post(context: bpy.types.Context, space_type: str, item_idname: str | None, *, as_fallback=False):
