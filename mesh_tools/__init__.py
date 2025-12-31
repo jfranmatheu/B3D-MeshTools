@@ -14,7 +14,10 @@ bl_info = {
     "category": "Mesh",
 }
 
+from .addon_utils import AutoCode
+
 def register():
+    AutoCode.ICONS('icons.py', icons_path='assets/icons')
     register_drag_face()
     register_bridge()
 
