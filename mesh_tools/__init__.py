@@ -1,9 +1,3 @@
-import bpy
-
-from .drag_face import register as register_drag_face, unregister as unregister_drag_face
-from .bridge import register as register_bridge, unregister as unregister_bridge
-from .utils.override_helpers import unregister as unregister_overrides
-
 bl_info = {
     "name": "Mesh Tools",
     "author": "I",
@@ -14,17 +8,27 @@ bl_info = {
     "category": "Mesh",
 }
 
-from .addon_utils import AutoCode
+import bpy
 
-def register():
-    AutoCode.ICONS('icons.py', icons_path='assets/icons')
-    register_drag_face()
-    register_bridge()
+if bpy.app.background:
+    # Fix #25. Skip registering if Blender is in background.
+    def register():
+        pass
+    def unregister():
+        pass
+else:
+    from .addon_utils import AutoCode
+    AutoCode.ICONS('icons.py', 'assets/icons')
+    
+    from .drag_face import register as register_drag_face, unregister as unregister_drag_face
+    from .bridge import register as register_bridge, unregister as unregister_bridge
+    from .utils.override_helpers import unregister as unregister_overrides
+            
+    def register():
+        register_drag_face()
+        register_bridge()
 
-def unregister():
-    unregister_bridge()
-    unregister_drag_face()
-    unregister_overrides()
-
-if __name__ == "__main__":
-    register()
+    def unregister():
+        unregister_bridge()
+        unregister_drag_face()
+        unregister_overrides()

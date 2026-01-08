@@ -46,7 +46,7 @@ class IconsViewer:
                     
     @classmethod
     def get_dat_icon(cls, icon_name: str) -> str:
-        return GLOBALS.ICONS_PATH.joinpath(icon_name).with_suffix('.dat').as_posix()
+        return GLOBALS.ICONS_PATH.joinpath(icon_name).as_posix()
 
 
 class IconsEnum(Enum):

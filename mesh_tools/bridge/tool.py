@@ -20,6 +20,7 @@ from time import time
 from mathutils.bvhtree import BVHTree
 
 from ..utils.geometry import is_point_inside_circle, line_segment_inside_or_intersecting_circle, dist_to_segment
+from ..icons import Icons
 
 
 if not bpy.app.background:
@@ -124,7 +125,7 @@ class BridgePlusTool(bpy.types.WorkSpaceTool):
     bl_description = "Bridge faces with geometric resistance"
     bl_space_type = 'VIEW_3D'
     bl_context_mode = 'EDIT_MESH'
-    bl_icon = 'ops.transform.translate'
+    bl_icon = Icons.get_dat_icon('ops.mesh_tools.bridge_tool') # 'ops.transform.translate'
     bl_widget = None
     bl_keymap = (
         ("mesh.bridge_plus", {"type": 'LEFTMOUSE', "value": 'PRESS'}, {"use_tool": True}),
